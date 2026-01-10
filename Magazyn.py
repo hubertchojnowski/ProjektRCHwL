@@ -19,10 +19,7 @@ except Exception as e:
 # --- FUNKCJE POMOCNICZE (LOGIKA BIZNESOWA) ---
 
 def add_log(opis_zdarzenia):
-    """
-    Funkcja zapisująca historię operacji do tabeli 'historia'.
-    Działa w tle przy dodawaniu/usuwaniu/edycji.
-    """
+    """Zapisuje zdarzenia w historii"""
     try:
         supabase.table('historia').insert({"opis": opis_zdarzenia}).execute()
     except Exception as e:
@@ -41,6 +38,10 @@ def get_inventory_merged():
     if df_magazyn.empty:
         return pd.DataFrame()
 
+    # Jeśli nie ma kolumny cena (np. stare rekordy), wypełniamy zerami
+    if 'cena' not in df_magazyn.columns:
+        df_magazyn['cena'] = 0.0
+
     if not df_kategorie.empty and 'kategoria_id' in df_magazyn.columns:
         df_kategorie = df_kategorie.rename(columns={'nazwa': 'kategoria_nazwa', 'id': 'kat_id'})
         df_merged = pd.merge(
@@ -53,102 +54,172 @@ def get_inventory_merged():
         return df_merged
     return df_magazyn
 
-def add_item(nazwa, ilosc, kategoria_id, kategoria_nazwa):
-    data = {"nazwa": nazwa, "ilosc": ilosc, "kategoria_id": int(kategoria_id)}
-    supabase.table('magazyn').insert(data).execute()
-    # Logujemy operację
-    add_log(f"➕ Przyjęto towar: {nazwa} ({ilosc} szt.), kat: {kategoria_nazwa}")
+def add_or_update_item(nazwa, ilosc, cena, kategoria_id, kategoria_nazwa):
+    """
+    Sprawdza czy towar istnieje. 
+    Jeśli TAK -> aktualizuje ilość i cenę.
+    Jeśli NIE -> dodaje nowy.
+    """
+    # 1. Sprawdzamy czy produkt o tej nazwie już jest w bazie
+    existing = supabase.table('magazyn').select("*").eq('nazwa', nazwa).execute()
+    
+    if existing.data:
+        # PRODUKT ISTNIEJE - AKTUALIZUJEMY
+        item_id = existing.data[0]['id']
+        old_qty = existing.data[0]['ilosc']
+        new_total_qty = old_qty + ilosc
+        
+        # Aktualizujemy ilość oraz cenę (przyjmujemy nową cenę jako aktualną)
+        supabase.table('magazyn').update({
+            "ilosc": new_total_qty,
+            "cena": cena
+        }).eq("id", item_id).execute()
+        
+        add_log(f"🔄 Zaktualizowano '{nazwa}': ilość {old_qty}->{new_total_qty}, cena: {cena} PLN")
+        st.success(f"Produkt '{nazwa}' już istniał. Zwiększono ilość do {new_total_qty}.")
+        
+    else:
+        # PRODUKT NIE ISTNIEJE - TWORZYMY NOWY
+        data = {
+            "nazwa": nazwa, 
+            "ilosc": ilosc, 
+            "cena": cena,
+            "kategoria_id": int(kategoria_id)
+        }
+        supabase.table('magazyn').insert(data).execute()
+        add_log(f"➕ Przyjęto nowy towar: {nazwa} ({ilosc} szt., {cena} PLN), kat: {kategoria_nazwa}")
+        st.success(f"Dodano nowy produkt: {nazwa}")
 
-def update_quantity(item_id, old_qty, new_qty, item_name):
-    supabase.table('magazyn').update({"ilosc": new_quantity}).eq("id", item_id).execute()
-    # Logujemy operację
-    add_log(f"✏️ Zmiana stanu '{item_name}': z {old_qty} na {new_qty}")
+def update_item_details(item_id, old_qty, new_qty, old_price, new_price, item_name):
+    supabase.table('magazyn').update({
+        "ilosc": new_qty,
+        "cena": new_price
+    }).eq("id", item_id).execute()
+    
+    add_log(f"✏️ Edycja '{item_name}': Ilość {old_qty}->{new_qty}, Cena {old_price}->{new_price}")
 
 def delete_item(item_id, item_name):
     supabase.table('magazyn').delete().eq("id", item_id).execute()
-    # Logujemy operację
     add_log(f"🗑️ Usunięto trwale towar: {item_name}")
 
 # --- MENU APLIKACJI ---
 menu = ["Stan Magazynowy", "Przyjęcie Towaru (Dodaj)", "Wydanie/Edycja", "Historia Operacji", "Remanent (Raport)"]
 choice = st.sidebar.selectbox("Menu", menu)
 
-# --- WIDOK 1: STAN MAGAZYNOWY + ALERTY ---
+# --- WIDOK 1: STAN MAGAZYNOWY (Z AGREGACJĄ) ---
 if choice == "Stan Magazynowy":
     st.subheader("Aktualny stan magazynu")
     df = get_inventory_merged()
     
     if not df.empty and 'ilosc' in df.columns:
-        # === MODUŁ ALERTÓW (Nowość!) ===
-        # Sprawdzamy, czy coś ma stan poniżej 5 sztuk
-        MINIMUM_LOGISTYCZNE = 5
-        low_stock = df[df['ilosc'] < MINIMUM_LOGISTYCZNE]
         
+        # === AGREGACJA DANYCH (Rozwiązanie problemu duplikatów w widoku) ===
+        # Jeśli masz w bazie 2x "iPhone 13", ten kod wyświetli je jako jeden wiersz z sumą
+        if 'kategoria_nazwa' in df.columns:
+            # Grupujemy po nazwie i kategorii
+            df_view = df.groupby(['nazwa', 'kategoria_nazwa'], as_index=False).agg({
+                'ilosc': 'sum',
+                'cena': 'mean' # Średnia cena (lub 'max' jeśli wolisz)
+            })
+            df_view = df_view.rename(columns={'kategoria_nazwa': 'Kategoria'})
+        else:
+            df_view = df.groupby(['nazwa'], as_index=False).agg({'ilosc': 'sum', 'cena': 'mean'})
+
+        # === OBLICZANIE WARTOŚCI ===
+        df_view['Wartość Całkowita'] = df_view['ilosc'] * df_view['cena']
+        
+        # === ALERT ===
+        MINIMUM_LOGISTYCZNE = 5
+        low_stock = df_view[df_view['ilosc'] < MINIMUM_LOGISTYCZNE]
         if not low_stock.empty:
             st.error(f"🚨 ALERT! Niskie stany magazynowe ({len(low_stock)} prod.):")
             for index, row in low_stock.iterrows():
-                st.warning(f"⚠️ **{row['nazwa']}**: zostało tylko {row['ilosc']} szt. (Zamów towar!)")
+                st.warning(f"⚠️ **{row['nazwa']}**: zostało {row['ilosc']} szt.")
             st.divider()
-        # ================================
 
-        # Wyświetlanie tabeli
-        cols_to_show = ['nazwa', 'ilosc']
-        if 'kategoria_nazwa' in df.columns:
-            df = df.rename(columns={'kategoria_nazwa': 'Kategoria'})
-            cols_to_show = ['nazwa', 'Kategoria', 'ilosc']
-            
-        st.dataframe(df[cols_to_show], use_container_width=True)
+        # Wyświetlanie tabeli (z formatowaniem ceny)
+        st.dataframe(
+            df_view[['nazwa', 'Kategoria', 'ilosc', 'cena', 'Wartość Całkowita']].style.format({
+                'cena': '{:.2f} PLN',
+                'Wartość Całkowita': '{:.2f} PLN'
+            }), 
+            use_container_width=True
+        )
         
-        # Szybkie KPI
+        # === KPI (STATYSTYKI) ===
+        total_qty = df_view['ilosc'].sum()
+        total_value = df_view['Wartość Całkowita'].sum()
+        
         c1, c2, c3 = st.columns(3)
-        c1.metric("Suma produktów", df['ilosc'].sum())
-        c2.metric("Liczba pozycji (SKU)", len(df))
-        c3.metric("Wartość magazynu", "Brak danych cenowych")
+        c1.metric("Suma produktów (szt.)", int(total_qty))
+        c2.metric("Liczba pozycji (SKU)", len(df_view))
+        # Tutaj wyświetlamy obliczoną wartość
+        c3.metric("Wartość magazynu", f"{total_value:,.2f} PLN")
         
     else:
         st.info("Magazyn pusty.")
 
-# --- WIDOK 2: PRZYJĘCIE TOWARU ---
+# --- WIDOK 2: PRZYJĘCIE TOWARU (Z CENĄ I SPRAWDZANIEM) ---
 elif choice == "Przyjęcie Towaru (Dodaj)":
-    st.subheader("Przyjęcie (Relacja z tabelą Kategorie)")
+    st.subheader("Przyjęcie (Inteligentne dodawanie)")
+    st.info("Jeśli dodasz produkt o nazwie, która już istnieje, system zsumuje ilości!")
+    
     df_cats = get_categories()
     
     if df_cats.empty:
         st.error("Brak kategorii w bazie!")
     else:
-        with st.form("add_form_relational"):
-            name = st.text_input("Nazwa produktu")
-            cat_dict = dict(zip(df_cats['nazwa'], df_cats['id']))
-            selected_cat_name = st.selectbox("Wybierz kategorię", list(cat_dict.keys()))
-            qty = st.number_input("Ilość", min_value=1, step=1)
+        with st.form("add_form_smart"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                name = st.text_input("Nazwa produktu")
+                cat_dict = dict(zip(df_cats['nazwa'], df_cats['id']))
+                selected_cat_name = st.selectbox("Wybierz kategorię", list(cat_dict.keys()))
             
-            if st.form_submit_button("Dodaj"):
+            with col_b:
+                qty = st.number_input("Ilość", min_value=1, step=1)
+                # Nowe pole CENA
+                price = st.number_input("Cena jedn. (PLN)", min_value=0.0, step=0.01, format="%.2f")
+            
+            if st.form_submit_button("Zatwierdź przyjęcie"):
                 if name:
                     selected_cat_id = cat_dict[selected_cat_name]
-                    add_item(name, qty, selected_cat_id, selected_cat_name)
-                    st.success(f"Dodano produkt: {name}")
+                    # Wywołujemy nową funkcję add_or_update
+                    add_or_update_item(name, qty, price, selected_cat_id, selected_cat_name)
+                    st.rerun()
                 else:
                     st.warning("Wpisz nazwę.")
 
-# --- WIDOK 3: WYDANIE / EDYCJA ---
+# --- WIDOK 3: WYDANIE / EDYCJA (Z CENĄ) ---
 elif choice == "Wydanie/Edycja":
-    st.subheader("Edycja Stanów")
+    st.subheader("Edycja Stanów i Cen")
     df = get_inventory_merged()
     
     if not df.empty and 'nazwa' in df.columns:
-        item_to_edit = st.selectbox("Produkt", df['nazwa'].unique())
+        # Tutaj sortujemy, żeby łatwiej znaleźć
+        sorted_names = sorted(df['nazwa'].unique())
+        item_to_edit = st.selectbox("Wybierz produkt do edycji", sorted_names)
         
+        # Pobieramy wiersz (jeśli są duplikaty w bazie, bierzemy pierwszy, 
+        # w profesjonalnym systemie powinniśmy scalić duplikaty, ale tutaj edytujemy rekordy)
         row = df[df['nazwa'] == item_to_edit].iloc[0]
+        
         curr_id = int(row['id'])
         curr_qty = int(row['ilosc'])
+        curr_price = float(row['cena']) if pd.notnull(row['cena']) else 0.0
         
-        st.write(f"Produkt: **{item_to_edit}** | Stan: **{curr_qty}**")
-        new_qty = st.number_input("Nowa ilość", value=curr_qty, min_value=0)
+        st.write(f"Produkt: **{item_to_edit}**")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            new_qty = st.number_input("Ilość", value=curr_qty, min_value=0)
+        with c2:
+            new_price = st.number_input("Cena (PLN)", value=curr_price, min_value=0.0, step=0.01)
         
         col1, col2 = st.columns(2)
-        if col1.button("Zapisz zmianę"):
-            update_quantity(curr_id, curr_qty, new_qty, item_to_edit)
-            st.success("Zapisano")
+        if col1.button("Zapisz zmiany"):
+            update_item_details(curr_id, curr_qty, new_qty, curr_price, new_price, item_to_edit)
+            st.success("Zapisano!")
             st.rerun()
             
         if col2.button("Usuń trwale"):
@@ -156,40 +227,37 @@ elif choice == "Wydanie/Edycja":
             st.error("Usunięto!")
             st.rerun()
 
-# --- WIDOK 4: HISTORIA (Nowość!) ---
+# --- WIDOK 4: HISTORIA ---
 elif choice == "Historia Operacji":
-    st.subheader("🕵️ Dziennik Zdarzeń (Logi)")
-    st.write("Pełna historia operacji wykonanych w systemie.")
-    
-    # Pobieramy historię sortując od najnowszych
+    st.subheader("🕵️ Dziennik Zdarzeń")
     try:
         response = supabase.table('historia').select("*").order("created_at", desc=True).execute()
         df_hist = pd.DataFrame(response.data)
-        
         if not df_hist.empty:
-            # Formatujemy datę, żeby była czytelna (usuwamy "T" i strefę czasową dla czytelności)
             df_hist['created_at'] = pd.to_datetime(df_hist['created_at']).dt.strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Zmieniamy nazwy kolumn na ładne polskie
-            df_hist = df_hist.rename(columns={'created_at': 'Czas Operacji', 'opis': 'Opis Zdarzenia'})
-            
-            st.dataframe(df_hist[['Czas Operacji', 'Opis Zdarzenia']], use_container_width=True)
+            df_hist = df_hist.rename(columns={'created_at': 'Czas', 'opis': 'Zdarzenie'})
+            st.dataframe(df_hist[['Czas', 'Zdarzenie']], use_container_width=True)
         else:
-            st.info("Brak historii operacji.")
+            st.info("Brak historii.")
     except Exception as e:
-        st.error(f"Błąd pobierania historii: {e}")
+        st.error(f"Błąd: {e}")
 
 # --- WIDOK 5: REMANENT ---
 elif choice == "Remanent (Raport)":
     st.subheader("Raport Remanentowy")
     df = get_inventory_merged()
     if not df.empty:
+        # Kalkulacja wartości dla raportu
+        if 'cena' not in df.columns: df['cena'] = 0.0
+        df['Wartosc'] = df['ilosc'] * df['cena']
+        
         if 'kategoria_nazwa' in df.columns:
             df['Kategoria'] = df['kategoria_nazwa']
-            export_df = df[['nazwa', 'Kategoria', 'ilosc']]
+            export_df = df[['nazwa', 'Kategoria', 'ilosc', 'cena', 'Wartosc']]
         else:
             export_df = df
             
         export_df['data_spisu'] = datetime.datetime.now().strftime("%Y-%m-%d")
+        
         st.dataframe(export_df)
-        st.download_button("Pobierz CSV", export_df.to_csv(index=False).encode('utf-8'), "remanent.csv")
+        st.download_button("Pobierz CSV", export_df.to_csv(index=False).encode('utf-8'), "remanent_wycena.csv")
