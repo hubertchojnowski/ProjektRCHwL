@@ -4,139 +4,161 @@ import pandas as pd
 import datetime
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="Magazyn w Chmurze", layout="centered")
+st.set_page_config(page_title="Magazyn w Chmurze (Relacyjny)", layout="centered")
 st.title("📦 System WMS - Logistyka")
 
 # --- POŁĄCZENIE Z BAZĄ DANYCH ---
 try:
-    # Upewnij się, że w Secrets na Streamlit masz wpisane SUPABASE_URL i SUPABASE_KEY
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
     supabase: Client = create_client(url, key)
 except Exception as e:
-    st.error("Nie udało się połączyć z bazą danych. Sprawdź sekrety w ustawieniach Streamlit!")
+    st.error("Błąd połączenia z bazą. Sprawdź sekrety!")
     st.stop()
 
 # --- FUNKCJE POMOCNICZE ---
 
-def get_inventory():
-    """Pobiera aktualny stan z tabeli 'magazyn'"""
-    # ZMIANA: Tabela nazywa się teraz 'magazyn'
-    response = supabase.table('magazyn').select("*").execute()
+def get_categories():
+    """Pobiera słownik kategorii z tabeli 'kategorie'"""
+    response = supabase.table('kategorie').select("*").execute()
     return pd.DataFrame(response.data)
 
-def add_item(nazwa, ilosc, kategoria):
-    """Dodaje nowy produkt"""
-    # ZMIANA: Używamy polskich nazw kolumn: nazwa, ilosc, kategoria
-    data = {"nazwa": nazwa, "ilosc": ilosc, "kategoria": kategoria}
+def get_inventory_merged():
+    """
+    Pobiera stan magazynu i łączy go z tabelą kategorii,
+    aby wyświetlić nazwę kategorii zamiast samego ID.
+    """
+    # 1. Pobierz towary
+    response_magazyn = supabase.table('magazyn').select("*").execute()
+    df_magazyn = pd.DataFrame(response_magazyn.data)
+    
+    # 2. Pobierz kategorie
+    df_kategorie = get_categories()
+    
+    # Jeśli magazyn jest pusty, zwróć pusty DataFrame
+    if df_magazyn.empty:
+        return pd.DataFrame()
+
+    # 3. Połącz tabele (MERGE / JOIN) - to jest to 'łączenie' o które pytałeś
+    # Łączymy kolumnę 'kategoria_id' z magazynu z 'id' z kategorii
+    if not df_kategorie.empty and 'kategoria_id' in df_magazyn.columns:
+        # Zmieniamy nazwę kolumny 'nazwa' w kategoriach na 'kategoria_nazwa' żeby się nie myliło
+        df_kategorie = df_kategorie.rename(columns={'nazwa': 'kategoria_nazwa', 'id': 'kat_id'})
+        
+        # Merge (Left Join)
+        df_merged = pd.merge(
+            df_magazyn, 
+            df_kategorie, 
+            left_on='kategoria_id', 
+            right_on='kat_id', 
+            how='left'
+        )
+        return df_merged
+    
+    return df_magazyn
+
+def add_item(nazwa, ilosc, kategoria_id):
+    """Dodaje produkt z relacją do ID kategorii"""
+    # Zapisujemy ID kategorii, a nie jej nazwę!
+    data = {
+        "nazwa": nazwa, 
+        "ilosc": ilosc, 
+        "kategoria_id": int(kategoria_id)
+    }
     supabase.table('magazyn').insert(data).execute()
 
 def update_quantity(item_id, new_quantity):
-    """Aktualizuje ilość"""
-    # ZMIANA: Aktualizujemy kolumnę 'ilosc'
     supabase.table('magazyn').update({"ilosc": new_quantity}).eq("id", item_id).execute()
 
 def delete_item(item_id):
-    """Usuwa produkt"""
     supabase.table('magazyn').delete().eq("id", item_id).execute()
 
 # --- MENU APLIKACJI ---
 menu = ["Stan Magazynowy", "Przyjęcie Towaru (Dodaj)", "Wydanie/Edycja", "Remanent (Raport)"]
 choice = st.sidebar.selectbox("Menu", menu)
 
-# --- WIDOK 1: STAN MAGAZYNOWY ---
+# --- LOGIKA ---
+
 if choice == "Stan Magazynowy":
     st.subheader("Aktualny stan magazynu")
-    df = get_inventory()
-    
-    if not df.empty:
-        # ZMIANA: Sortowanie po kolumnie 'nazwa'
-        if 'nazwa' in df.columns:
-            df = df.sort_values(by='nazwa')
-            # Wyświetlanie konkretnych kolumn
-            st.dataframe(df[['nazwa', 'kategoria', 'ilosc']], use_container_width=True)
-            
-            # Statystyki
-            st.metric("Łączna ilość produktów", df['ilosc'].sum())
-        else:
-            st.error("Błąd: Nie znaleziono kolumny 'nazwa' w bazie danych.")
-            st.write("Dostępne kolumny:", df.columns.tolist())
-    else:
-        st.info("Magazyn jest pusty.")
-
-# --- WIDOK 2: PRZYJĘCIE TOWARU ---
-elif choice == "Przyjęcie Towaru (Dodaj)":
-    st.subheader("Dodaj nowy produkt do bazy")
-    
-    with st.form("add_form"):
-        # ZMIANA: Zmienne dostosowane do polskich nazw
-        name_input = st.text_input("Nazwa produktu")
-        cat_input = st.selectbox("Kategoria", ["Elektronika", "Spożywcze", "Chemia", "Inne", "Części Zamienne"])
-        qty_input = st.number_input("Ilość początkowa", min_value=1, step=1)
-        
-        submitted = st.form_submit_button("Dodaj do magazynu")
-        
-        if submitted:
-            if name_input:
-                add_item(name_input, qty_input, cat_input)
-                st.success(f"Dodano {name_input} ({qty_input} szt.) do magazynu!")
-            else:
-                st.warning("Podaj nazwę produktu.")
-
-# --- WIDOK 3: WYDANIE / EDYCJA ---
-elif choice == "Wydanie/Edycja":
-    st.subheader("Zarządzaj towarem")
-    df = get_inventory()
+    df = get_inventory_merged()
     
     if not df.empty and 'nazwa' in df.columns:
-        item_to_edit = st.selectbox("Wybierz produkt", df['nazwa'].unique())
+        # Wybieramy co chcemy pokazać. Teraz mamy kolumnę 'kategoria_nazwa' z połączenia
+        cols_to_show = ['nazwa', 'ilosc']
         
-        # Pobierz dane wybranego produktu
-        current_item = df[df['nazwa'] == item_to_edit].iloc[0]
-        current_id = int(current_item['id'])
-        current_qty = int(current_item['ilosc']) # ZMIANA: kolumna ilosc
+        if 'kategoria_nazwa' in df.columns:
+            cols_to_show.append('kategoria_nazwa')
+            # Ładniejsza nazwa kolumny do wyświetlenia
+            df = df.rename(columns={'kategoria_nazwa': 'Kategoria'})
+            cols_to_show = ['nazwa', 'Kategoria', 'ilosc']
+            
+        st.dataframe(df[cols_to_show], use_container_width=True)
+        st.metric("Suma produktów", df['ilosc'].sum())
+    else:
+        st.info("Magazyn pusty.")
+
+elif choice == "Przyjęcie Towaru (Dodaj)":
+    st.subheader("Przyjęcie (Relacja z tabelą Kategorie)")
+    
+    # Najpierw pobieramy dostępne kategorie z bazy
+    df_cats = get_categories()
+    
+    if df_cats.empty:
+        st.error("Brak kategorii w bazie! Dodaj je w Supabase w tabeli 'kategorie'.")
+    else:
+        with st.form("add_form_relational"):
+            name = st.text_input("Nazwa produktu")
+            
+            # Tworzymy słownik: Nazwa Kategorii -> ID Kategorii
+            # Dzięki temu użytkownik widzi nazwę, a my wysyłamy do bazy ID
+            cat_dict = dict(zip(df_cats['nazwa'], df_cats['id']))
+            selected_cat_name = st.selectbox("Wybierz kategorię", list(cat_dict.keys()))
+            
+            qty = st.number_input("Ilość", min_value=1, step=1)
+            
+            if st.form_submit_button("Dodaj"):
+                # Pobieramy ID dla wybranej nazwy
+                selected_cat_id = cat_dict[selected_cat_name]
+                
+                add_item(name, qty, selected_cat_id)
+                st.success(f"Dodano produkt do kategorii '{selected_cat_name}' (ID={selected_cat_id})")
+
+elif choice == "Wydanie/Edycja":
+    st.subheader("Edycja Stanów")
+    df = get_inventory_merged()
+    
+    if not df.empty and 'nazwa' in df.columns:
+        item_to_edit = st.selectbox("Produkt", df['nazwa'].unique())
         
-        st.write(f"Produkt: **{item_to_edit}**")
-        st.write(f"Aktualna ilość: **{current_qty}**")
+        row = df[df['nazwa'] == item_to_edit].iloc[0]
+        curr_id = int(row['id'])
+        curr_qty = int(row['ilosc'])
+        
+        st.write(f"Aktualnie: {curr_qty} szt.")
+        new_qty = st.number_input("Nowa ilość", value=curr_qty)
         
         col1, col2 = st.columns(2)
-        
-        with col1:
-            new_qty = st.number_input("Nowa ilość", min_value=0, value=current_qty, step=1)
-            if st.button("Zaktualizuj ilość"):
-                update_quantity(current_id, new_qty)
-                st.success("Zaktualizowano!")
-                st.rerun()
-        
-        with col2:
-            st.write("---")
-            if st.button("🗑️ Usuń produkt z bazy"):
-                delete_item(current_id)
-                st.error("Produkt usunięty!")
-                st.rerun()
-    else:
-        st.info("Brak produktów do edycji lub błąd nazw kolumn.")
+        if col1.button("Zapisz zmianę"):
+            update_quantity(curr_id, new_qty)
+            st.success("Zapisano")
+            st.rerun()
+            
+        if col2.button("Usuń"):
+            delete_item(curr_id)
+            st.rerun()
 
-# --- WIDOK 4: REMANENT ---
 elif choice == "Remanent (Raport)":
-    st.subheader("Przeprowadź Remanent")
-    st.write("Pobierz aktualny stan magazynowy do pliku CSV.")
-    
-    df = get_inventory()
-    
+    st.subheader("Raport Remanentowy")
+    df = get_inventory_merged()
     if not df.empty:
-        df['data_remanentu'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Wyświetlamy podgląd
-        st.dataframe(df)
-        
-        csv = df.to_csv(index=False).encode('utf-8')
-        
-        st.download_button(
-            label="📥 Pobierz Protokół Remanentu (CSV)",
-            data=csv,
-            file_name='remanent_magazyn.csv',
-            mime='text/csv',
-        )
-    else:
-        st.info("Brak danych do remanentu.")
+        # Czyścimy dane do ładnego CSV (tylko nazwa, kategoria, ilość)
+        if 'kategoria_nazwa' in df.columns:
+            df['Kategoria'] = df['kategoria_nazwa']
+            export_df = df[['nazwa', 'Kategoria', 'ilosc']]
+        else:
+            export_df = df
+            
+        export_df['data_spisu'] = datetime.datetime.now().strftime("%Y-%m-%d")
+        st.dataframe(export_df)
+        st.download_button("Pobierz CSV", export_df.to_csv(index=False).encode('utf-8'), "remanent.csv")
