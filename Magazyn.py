@@ -4,8 +4,8 @@ import pandas as pd
 import datetime
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="Magazyn w Chmurze PRO", layout="centered")
-st.title("📦 System WMS - Logistyka")
+st.set_page_config(page_title="WMS Logistyka PRO", layout="wide") # Zmieniłem layout na szeroki, bo mamy dużo kolumn
+st.title("📦 System WMS - Logistyka (Z Dostawcami)")
 
 # --- POŁĄCZENIE Z BAZĄ DANYCH ---
 try:
@@ -29,34 +29,63 @@ def get_categories():
     response = supabase.table('kategorie').select("*").execute()
     return pd.DataFrame(response.data)
 
+def get_suppliers():
+    """Nowa funkcja do pobierania dostawców"""
+    response = supabase.table('dostawcy').select("*").execute()
+    return pd.DataFrame(response.data)
+
 def get_inventory_merged():
-    """Pobiera stan magazynu i łączy z kategoriami"""
+    """Pobiera stan magazynu i łączy z kategoriami ORAZ dostawcami"""
     response_magazyn = supabase.table('magazyn').select("*").execute()
     df_magazyn = pd.DataFrame(response_magazyn.data)
-    df_kategorie = get_categories()
     
     if df_magazyn.empty:
         return pd.DataFrame()
 
+    # Uzupełniamy braki w cenie
     if 'cena' not in df_magazyn.columns:
         df_magazyn['cena'] = 0.0
 
+    # 1. Pobieramy słowniki
+    df_kategorie = get_categories()
+    df_dostawcy = get_suppliers()
+
+    # 2. Łączymy z Kategoriami
     if not df_kategorie.empty and 'kategoria_id' in df_magazyn.columns:
         df_kategorie = df_kategorie.rename(columns={'nazwa': 'kategoria_nazwa', 'id': 'kat_id'})
-        df_merged = pd.merge(
+        df_magazyn = pd.merge(
             df_magazyn, 
             df_kategorie, 
             left_on='kategoria_id', 
             right_on='kat_id', 
             how='left'
         )
-        return df_merged
+
+    # 3. Łączymy z Dostawcami (Nowość!)
+    if not df_dostawcy.empty and 'dostawca_id' in df_magazyn.columns:
+        # Zmieniamy nazwy kolumn, żeby nie było konfliktu (nazwa dostawcy vs nazwa towaru)
+        df_dostawcy = df_dostawcy.rename(columns={'nazwa': 'dostawca_nazwa', 'id': 'dost_id', 'nip': 'dostawca_nip'})
+        df_magazyn = pd.merge(
+            df_magazyn,
+            df_dostawcy[['dost_id', 'dostawca_nazwa', 'dostawca_nip']], # bierzemy tylko to co potrzebne
+            left_on='dostawca_id',
+            right_on='dost_id',
+            how='left'
+        )
+    
+    # Uzupełnij "Brak dostawcy" tam gdzie pusto (dla starych rekordów)
+    if 'dostawca_nazwa' in df_magazyn.columns:
+        df_magazyn['dostawca_nazwa'] = df_magazyn['dostawca_nazwa'].fillna('Brak danych')
+
     return df_magazyn
 
-def add_or_update_item(nazwa, ilosc, cena, kategoria_id, kategoria_nazwa):
-    existing = supabase.table('magazyn').select("*").eq('nazwa', nazwa).execute()
+def add_or_update_item(nazwa, ilosc, cena, kategoria_id, kategoria_nazwa, dostawca_id, dostawca_nazwa):
+    # Sprawdzamy czy towar o tej nazwie OD TEGO SAMEGO DOSTAWCY istnieje
+    # (Bo możemy mieć jabłka od Janusza i jabłka od Apple - to inne partie)
+    existing = supabase.table('magazyn').select("*").eq('nazwa', nazwa).eq('dostawca_id', dostawca_id).execute()
     
     if existing.data:
+        # AKTUALIZACJA
         item_id = existing.data[0]['id']
         old_qty = existing.data[0]['ilosc']
         new_total_qty = old_qty + ilosc
@@ -66,191 +95,204 @@ def add_or_update_item(nazwa, ilosc, cena, kategoria_id, kategoria_nazwa):
             "cena": cena
         }).eq("id", item_id).execute()
         
-        add_log(f"🔄 Zaktualizowano '{nazwa}': ilość {old_qty}->{new_total_qty}, cena: {cena} PLN")
-        st.success(f"Produkt '{nazwa}' już istniał. Zwiększono ilość do {new_total_qty}.")
+        add_log(f"🔄 Dostawa '{nazwa}' (od {dostawca_nazwa}): ilosc {old_qty}->{new_total_qty}")
+        st.success(f"Zaktualizowano stan produktu '{nazwa}' od dostawcy {dostawca_nazwa}.")
         
     else:
+        # NOWY WPIS
         data = {
             "nazwa": nazwa, 
             "ilosc": ilosc, 
             "cena": cena,
-            "kategoria_id": int(kategoria_id)
+            "kategoria_id": int(kategoria_id),
+            "dostawca_id": int(dostawca_id)
         }
         supabase.table('magazyn').insert(data).execute()
-        add_log(f"➕ Przyjęto nowy towar: {nazwa} ({ilosc} szt., {cena} PLN), kat: {kategoria_nazwa}")
+        add_log(f"➕ Nowy towar: {nazwa} ({ilosc} szt.), Dostawca: {dostawca_nazwa}")
         st.success(f"Dodano nowy produkt: {nazwa}")
 
-def update_item_details(item_id, old_qty, new_qty, old_price, new_price, item_name):
+def update_item_details(item_id, new_qty, new_price, item_name):
     supabase.table('magazyn').update({
         "ilosc": new_qty,
         "cena": new_price
     }).eq("id", item_id).execute()
-    
-    add_log(f"✏️ Edycja '{item_name}': Ilość {old_qty}->{new_qty}, Cena {old_price}->{new_price}")
+    add_log(f"✏️ Ręczna edycja '{item_name}': ilosc={new_qty}, cena={new_price}")
 
 def delete_item(item_id, item_name):
     supabase.table('magazyn').delete().eq("id", item_id).execute()
-    add_log(f"🗑️ Usunięto trwale towar: {item_name}")
+    add_log(f"🗑️ Usunięto: {item_name}")
 
 # --- MENU APLIKACJI ---
 menu = ["Stan Magazynowy", "Przyjęcie Towaru (Dodaj)", "Wydanie/Edycja", "Historia Operacji", "Remanent (Raport)"]
 choice = st.sidebar.selectbox("Menu", menu)
 
-# --- WIDOK 1: STAN MAGAZYNOWY (Z AGREGACJĄ I FILTRACJĄ ZER) ---
+# --- WIDOK 1: STAN MAGAZYNOWY ---
 if choice == "Stan Magazynowy":
     st.subheader("Aktualny stan magazynu")
     df = get_inventory_merged()
     
     if not df.empty and 'ilosc' in df.columns:
         
-        # 1. Agregacja (sumowanie duplikatów)
-        if 'kategoria_nazwa' in df.columns:
-            df_view = df.groupby(['nazwa', 'kategoria_nazwa'], as_index=False).agg({
-                'ilosc': 'sum',
-                'cena': 'mean'
-            })
-            df_view = df_view.rename(columns={'kategoria_nazwa': 'Kategoria'})
-        else:
-            df_view = df.groupby(['nazwa'], as_index=False).agg({'ilosc': 'sum', 'cena': 'mean'})
+        # Kolumny do grupowania (Nazwa, Kategoria, Dostawca)
+        group_cols = ['nazwa']
+        if 'kategoria_nazwa' in df.columns: group_cols.append('kategoria_nazwa')
+        if 'dostawca_nazwa' in df.columns: group_cols.append('dostawca_nazwa')
+        
+        # AGREGACJA
+        df_view = df.groupby(group_cols, as_index=False).agg({
+            'ilosc': 'sum',
+            'cena': 'mean'
+        })
+        
+        # Rename dla czytelności
+        rename_map = {'kategoria_nazwa': 'Kategoria', 'dostawca_nazwa': 'Dostawca'}
+        df_view = df_view.rename(columns=rename_map)
 
-        # 2. FILTRACJA - Wyrzucamy 0 i mniej
+        # FILTRACJA (usuwamy 0)
         df_view = df_view[df_view['ilosc'] > 0]
 
         if not df_view.empty:
-            # Obliczanie wartości
-            df_view['Wartość Całkowita'] = df_view['ilosc'] * df_view['cena']
+            df_view['Wartość'] = df_view['ilosc'] * df_view['cena']
             
-            # === ALERT ===
-            MINIMUM_LOGISTYCZNE = 5
-            low_stock = df_view[df_view['ilosc'] < MINIMUM_LOGISTYCZNE]
-            
+            # ALERT
+            MINIMUM = 5
+            low_stock = df_view[df_view['ilosc'] < MINIMUM]
             if not low_stock.empty:
-                st.error(f"🚨 ALERT! Niskie stany magazynowe ({len(low_stock)} prod.):")
-                for index, row in low_stock.iterrows():
-                    st.warning(f"⚠️ **{row['nazwa']}**: zostało {row['ilosc']} szt.")
+                st.error(f"🚨 ALERT! Niskie stany ({len(low_stock)} poz.):")
+                for i, row in low_stock.iterrows():
+                    dost = row['Dostawca'] if 'Dostawca' in row else ''
+                    st.warning(f"⚠️ **{row['nazwa']}** ({dost}): tylko {row['ilosc']} szt.")
                 st.divider()
 
-            # Wyświetlanie tabeli
+            # TABELA
+            cols_to_show = ['nazwa', 'Kategoria', 'Dostawca', 'ilosc', 'cena', 'Wartość']
+            # Zabezpieczenie gdyby jakiejś kolumny nie było (np. brak dostawców w bazie)
+            final_cols = [c for c in cols_to_show if c in df_view.columns]
+            
             st.dataframe(
-                df_view[['nazwa', 'Kategoria', 'ilosc', 'cena', 'Wartość Całkowita']].style.format({
-                    'cena': '{:.2f} PLN',
-                    'Wartość Całkowita': '{:.2f} PLN'
-                }), 
+                df_view[final_cols].style.format({'cena': '{:.2f} zł', 'Wartość': '{:.2f} zł'}), 
                 use_container_width=True
             )
             
             # KPI
-            total_qty = df_view['ilosc'].sum()
-            total_value = df_view['Wartość Całkowita'].sum()
-            
             c1, c2, c3 = st.columns(3)
-            c1.metric("Suma produktów (szt.)", int(total_qty))
-            c2.metric("Liczba pozycji (SKU)", len(df_view))
-            c3.metric("Wartość magazynu", f"{total_value:,.2f} PLN")
+            c1.metric("Ilość sztuk", int(df_view['ilosc'].sum()))
+            c2.metric("Wartość magazynu", f"{df_view['Wartość'].sum():,.2f} zł")
+            c3.metric("Liczba dostawców", df_view['Dostawca'].nunique() if 'Dostawca' in df_view else 0)
         else:
-            st.info("Magazyn pusty (brak produktów o ilości > 0).")
-            
+            st.info("Magazyn pusty (brak towarów > 0 szt).")
     else:
-        st.info("Brak danych w bazie.")
+        st.info("Brak danych.")
 
 # --- WIDOK 2: PRZYJĘCIE TOWARU ---
 elif choice == "Przyjęcie Towaru (Dodaj)":
-    st.subheader("Przyjęcie (Inteligentne dodawanie)")
-    st.info("Jeśli dodasz produkt o nazwie, która już istnieje, system zsumuje ilości!")
+    st.subheader("Przyjęcie Towaru")
     
     df_cats = get_categories()
+    df_supp = get_suppliers()
     
     if df_cats.empty:
-        st.error("Brak kategorii w bazie!")
+        st.error("⚠️ Brak kategorii! Dodaj je w Supabase.")
+    elif df_supp.empty:
+        st.error("⚠️ Brak dostawców! Dodaj ich w Supabase (tabela 'dostawcy').")
     else:
-        with st.form("add_form_smart"):
-            col_a, col_b = st.columns(2)
-            with col_a:
+        with st.form("add_form_full"):
+            c1, c2 = st.columns(2)
+            with c1:
                 name = st.text_input("Nazwa produktu")
+                
+                # Słownik kategorii
                 cat_dict = dict(zip(df_cats['nazwa'], df_cats['id']))
-                selected_cat_name = st.selectbox("Wybierz kategorię", list(cat_dict.keys()))
+                sel_cat = st.selectbox("Kategoria", list(cat_dict.keys()))
+                
+                # Słownik dostawców
+                supp_dict = dict(zip(df_supp['nazwa'], df_supp['id']))
+                sel_supp = st.selectbox("Dostawca", list(supp_dict.keys()))
             
-            with col_b:
-                qty = st.number_input("Ilość", min_value=1, step=1)
-                price = st.number_input("Cena jedn. (PLN)", min_value=0.0, step=0.01, format="%.2f")
-            
-            if st.form_submit_button("Zatwierdź przyjęcie"):
+            with c2:
+                qty = st.number_input("Ilość", min_value=1)
+                price = st.number_input("Cena zakupu (zł)", min_value=0.01, step=0.01)
+
+            if st.form_submit_button("Zatwierdź Przyjęcie"):
                 if name:
-                    selected_cat_id = cat_dict[selected_cat_name]
-                    add_or_update_item(name, qty, price, selected_cat_id, selected_cat_name)
+                    cat_id = cat_dict[sel_cat]
+                    supp_id = supp_dict[sel_supp]
+                    add_or_update_item(name, qty, price, cat_id, sel_cat, supp_id, sel_supp)
                     st.rerun()
                 else:
-                    st.warning("Wpisz nazwę.")
+                    st.warning("Podaj nazwę towaru.")
 
-# --- WIDOK 3: WYDANIE / EDYCJA ---
+# --- WIDOK 3: EDYCJA ---
 elif choice == "Wydanie/Edycja":
-    st.subheader("Edycja Stanów i Cen")
+    st.subheader("Edycja")
     df = get_inventory_merged()
     
     if not df.empty and 'nazwa' in df.columns:
-        sorted_names = sorted(df['nazwa'].unique())
-        item_to_edit = st.selectbox("Wybierz produkt do edycji", sorted_names)
+        # Tworzymy unikalną etykietę dla listy rozwijanej (Nazwa + Dostawca)
+        # bo możemy mieć ten sam towar od dwóch dostawców
+        df['label'] = df['nazwa'] + " (Dost: " + df['dostawca_nazwa'].fillna('?') + ")"
         
-        # Pobieramy pierwszy napotkany wiersz
-        row = df[df['nazwa'] == item_to_edit].iloc[0]
+        # Sortujemy
+        sorted_labels = sorted(df['label'].unique())
+        sel_label = st.selectbox("Wybierz produkt", sorted_labels)
+        
+        # Znajdujemy wiersz
+        row = df[df['label'] == sel_label].iloc[0]
         
         curr_id = int(row['id'])
         curr_qty = int(row['ilosc'])
-        curr_price = float(row['cena']) if pd.notnull(row['cena']) else 0.0
+        curr_price = float(row['cena'])
         
-        st.write(f"Produkt: **{item_to_edit}**")
+        st.info(f"Edytujesz: **{row['nazwa']}** | Kategoria: {row.get('kategoria_nazwa','-')} | Dostawca: {row.get('dostawca_nazwa','-')}")
         
         c1, c2 = st.columns(2)
-        with c1:
-            new_qty = st.number_input("Ilość", value=curr_qty, min_value=0)
-        with c2:
-            new_price = st.number_input("Cena (PLN)", value=curr_price, min_value=0.0, step=0.01)
+        new_qty = c1.number_input("Ilość", value=curr_qty)
+        new_price = c2.number_input("Cena", value=curr_price)
         
-        col1, col2 = st.columns(2)
-        if col1.button("Zapisz zmiany"):
-            update_item_details(curr_id, curr_qty, new_qty, curr_price, new_price, item_to_edit)
+        b1, b2 = st.columns(2)
+        if b1.button("Zapisz"):
+            update_item_details(curr_id, new_qty, new_price, row['nazwa'])
             st.success("Zapisano!")
             st.rerun()
-            
-        if col2.button("Usuń trwale"):
-            delete_item(curr_id, item_to_edit)
-            st.error("Usunięto!")
+        if b2.button("Usuń trwale"):
+            delete_item(curr_id, row['nazwa'])
             st.rerun()
     else:
-        st.info("Brak produktów do edycji.")
+        st.info("Brak danych.")
 
 # --- WIDOK 4: HISTORIA ---
 elif choice == "Historia Operacji":
-    st.subheader("🕵️ Dziennik Zdarzeń")
+    st.subheader("🕵️ Historia")
     try:
-        response = supabase.table('historia').select("*").order("created_at", desc=True).execute()
-        df_hist = pd.DataFrame(response.data)
-        if not df_hist.empty:
-            df_hist['created_at'] = pd.to_datetime(df_hist['created_at']).dt.strftime('%Y-%m-%d %H:%M:%S')
-            df_hist = df_hist.rename(columns={'created_at': 'Czas', 'opis': 'Zdarzenie'})
-            st.dataframe(df_hist[['Czas', 'Zdarzenie']], use_container_width=True)
+        res = supabase.table('historia').select("*").order("created_at", desc=True).execute()
+        dfh = pd.DataFrame(res.data)
+        if not dfh.empty:
+            dfh['created_at'] = pd.to_datetime(dfh['created_at']).dt.strftime('%Y-%m-%d %H:%M')
+            st.dataframe(dfh[['created_at', 'opis']], use_container_width=True)
         else:
-            st.info("Brak historii.")
-    except Exception as e:
-        st.error(f"Błąd: {e}")
+            st.info("Pusto.")
+    except:
+        st.error("Błąd historii.")
 
 # --- WIDOK 5: REMANENT ---
 elif choice == "Remanent (Raport)":
-    st.subheader("Raport Remanentowy")
-    st.write("Podgląd stanu magazynowego na dzień dzisiejszy.")
+    st.subheader("Raport na dzień dzisiejszy")
     df = get_inventory_merged()
     if not df.empty:
-        if 'cena' not in df.columns: df['cena'] = 0.0
         df['Wartosc'] = df['ilosc'] * df['cena']
         
-        if 'kategoria_nazwa' in df.columns:
-            df['Kategoria'] = df['kategoria_nazwa']
-            export_df = df[['nazwa', 'Kategoria', 'ilosc', 'cena', 'Wartosc']]
-        else:
-            export_df = df
+        # Ładne nazwy
+        cols = ['nazwa', 'ilosc', 'cena', 'Wartosc']
+        if 'kategoria_nazwa' in df.columns: 
+            df = df.rename(columns={'kategoria_nazwa': 'Kategoria'})
+            cols.insert(1, 'Kategoria')
+        if 'dostawca_nazwa' in df.columns:
+            df = df.rename(columns={'dostawca_nazwa': 'Dostawca'})
+            cols.insert(2, 'Dostawca')
             
-        export_df['data_spisu'] = datetime.datetime.now().strftime("%Y-%m-%d")
+        export_df = df[cols]
+        export_df['Data'] = datetime.datetime.now().strftime("%Y-%m-%d")
         
         st.dataframe(export_df, use_container_width=True)
     else:
-        st.info("Brak danych w magazynie.")
+        st.info("Magazyn pusty.")
