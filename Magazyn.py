@@ -105,7 +105,6 @@ if choice == "Stan Magazynowy":
         
         # 1. Agregacja (sumowanie duplikatów)
         if 'kategoria_nazwa' in df.columns:
-            # TU BYŁ BŁĄD - poprawione na .groupby
             df_view = df.groupby(['nazwa', 'kategoria_nazwa'], as_index=False).agg({
                 'ilosc': 'sum',
                 'cena': 'mean'
@@ -114,7 +113,7 @@ if choice == "Stan Magazynowy":
         else:
             df_view = df.groupby(['nazwa'], as_index=False).agg({'ilosc': 'sum', 'cena': 'mean'})
 
-        # 2. !!! FILTRACJA !!! - Tutaj wyrzucamy wszystko co ma 0 lub mniej
+        # 2. FILTRACJA - Wyrzucamy 0 i mniej
         df_view = df_view[df_view['ilosc'] > 0]
 
         if not df_view.empty:
@@ -188,5 +187,69 @@ elif choice == "Wydanie/Edycja":
     st.subheader("Edycja Stanów i Cen")
     df = get_inventory_merged()
     
+    # Tutaj był błąd - teraz jest poprawione
     if not df.empty and 'nazwa' in df.columns:
-        sorted_names = s
+        sorted_names = sorted(df['nazwa'].unique())
+        item_to_edit = st.selectbox("Wybierz produkt do edycji", sorted_names)
+        
+        # Pobieramy pierwszy napotkany wiersz
+        row = df[df['nazwa'] == item_to_edit].iloc[0]
+        
+        curr_id = int(row['id'])
+        curr_qty = int(row['ilosc'])
+        curr_price = float(row['cena']) if pd.notnull(row['cena']) else 0.0
+        
+        st.write(f"Produkt: **{item_to_edit}**")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            new_qty = st.number_input("Ilość", value=curr_qty, min_value=0)
+        with c2:
+            new_price = st.number_input("Cena (PLN)", value=curr_price, min_value=0.0, step=0.01)
+        
+        col1, col2 = st.columns(2)
+        if col1.button("Zapisz zmiany"):
+            update_item_details(curr_id, curr_qty, new_qty, curr_price, new_price, item_to_edit)
+            st.success("Zapisano!")
+            st.rerun()
+            
+        if col2.button("Usuń trwale"):
+            delete_item(curr_id, item_to_edit)
+            st.error("Usunięto!")
+            st.rerun()
+    else:
+        st.info("Brak produktów do edycji.")
+
+# --- WIDOK 4: HISTORIA ---
+elif choice == "Historia Operacji":
+    st.subheader("🕵️ Dziennik Zdarzeń")
+    try:
+        response = supabase.table('historia').select("*").order("created_at", desc=True).execute()
+        df_hist = pd.DataFrame(response.data)
+        if not df_hist.empty:
+            df_hist['created_at'] = pd.to_datetime(df_hist['created_at']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            df_hist = df_hist.rename(columns={'created_at': 'Czas', 'opis': 'Zdarzenie'})
+            st.dataframe(df_hist[['Czas', 'Zdarzenie']], use_container_width=True)
+        else:
+            st.info("Brak historii.")
+    except Exception as e:
+        st.error(f"Błąd: {e}")
+
+# --- WIDOK 5: REMANENT ---
+elif choice == "Remanent (Raport)":
+    st.subheader("Raport Remanentowy")
+    df = get_inventory_merged()
+    if not df.empty:
+        if 'cena' not in df.columns: df['cena'] = 0.0
+        df['Wartosc'] = df['ilosc'] * df['cena']
+        
+        if 'kategoria_nazwa' in df.columns:
+            df['Kategoria'] = df['kategoria_nazwa']
+            export_df = df[['nazwa', 'Kategoria', 'ilosc', 'cena', 'Wartosc']]
+        else:
+            export_df = df
+            
+        export_df['data_spisu'] = datetime.datetime.now().strftime("%Y-%m-%d")
+        
+        st.dataframe(export_df)
+        st.download_button("Pobierz CSV", export_df.to_csv(index=False).encode('utf-8'), "remanent_wycena.csv")
