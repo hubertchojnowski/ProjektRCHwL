@@ -187,7 +187,6 @@ elif choice == "Wydanie/Edycja":
     st.subheader("Edycja Stanów i Cen")
     df = get_inventory_merged()
     
-    # Tutaj był błąd - teraz jest poprawione
     if not df.empty and 'nazwa' in df.columns:
         sorted_names = sorted(df['nazwa'].unique())
         item_to_edit = st.selectbox("Wybierz produkt do edycji", sorted_names)
@@ -238,6 +237,7 @@ elif choice == "Historia Operacji":
 # --- WIDOK 5: REMANENT ---
 elif choice == "Remanent (Raport)":
     st.subheader("Raport Remanentowy")
+    st.write("Podgląd stanu magazynowego na dzień dzisiejszy.")
     df = get_inventory_merged()
     if not df.empty:
         if 'cena' not in df.columns: df['cena'] = 0.0
@@ -251,5 +251,6 @@ elif choice == "Remanent (Raport)":
             
         export_df['data_spisu'] = datetime.datetime.now().strftime("%Y-%m-%d")
         
-        st.dataframe(export_df)
-        st.download_button("Pobierz CSV", export_df.to_csv(index=False).encode('utf-8'), "remanent_wycena.csv")
+        st.dataframe(export_df, use_container_width=True)
+    else:
+        st.info("Brak danych w magazynie.")
