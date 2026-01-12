@@ -4,7 +4,7 @@ import pandas as pd
 import datetime
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="WMS Logistyka PRO", layout="wide") # Zmieniłem layout na szeroki, bo mamy dużo kolumn
+st.set_page_config(page_title="WMS Logistyka PRO", layout="wide")
 st.title("📦 System WMS - Logistyka (Z Dostawcami)")
 
 # --- POŁĄCZENIE Z BAZĄ DANYCH ---
@@ -52,7 +52,12 @@ def get_inventory_merged():
 
     # 2. Łączymy z Kategoriami
     if not df_kategorie.empty and 'kategoria_id' in df_magazyn.columns:
+        # Konwersja na int, żeby uniknąć błędów łączenia
+        df_magazyn['kategoria_id'] = df_magazyn['kategoria_id'].fillna(0).astype(int)
+        df_kategorie['id'] = df_kategorie['id'].astype(int)
+        
         df_kategorie = df_kategorie.rename(columns={'nazwa': 'kategoria_nazwa', 'id': 'kat_id'})
+        
         df_magazyn = pd.merge(
             df_magazyn, 
             df_kategorie, 
@@ -61,19 +66,25 @@ def get_inventory_merged():
             how='left'
         )
 
-    # 3. Łączymy z Dostawcami (Nowość!)
+    # 3. Łączymy z Dostawcami (NAPRAWIONE ŁĄCZENIE)
     if not df_dostawcy.empty and 'dostawca_id' in df_magazyn.columns:
-        # Zmieniamy nazwy kolumn, żeby nie było konfliktu (nazwa dostawcy vs nazwa towaru)
+        # Zmieniamy nazwy kolumn w dostawcach
         df_dostawcy = df_dostawcy.rename(columns={'nazwa': 'dostawca_nazwa', 'id': 'dost_id', 'nip': 'dostawca_nip'})
+        
+        # !!! WAŻNE !!!: Zamieniamy puste wartości (NaN) na 0 i konwertujemy na liczby całkowite
+        # To naprawia błąd ValueError przy łączeniu
+        df_magazyn['dostawca_id'] = df_magazyn['dostawca_id'].fillna(0).astype(int)
+        df_dostawcy['dost_id'] = df_dostawcy['dost_id'].astype(int)
+
         df_magazyn = pd.merge(
             df_magazyn,
-            df_dostawcy[['dost_id', 'dostawca_nazwa', 'dostawca_nip']], # bierzemy tylko to co potrzebne
+            df_dostawcy[['dost_id', 'dostawca_nazwa', 'dostawca_nip']], 
             left_on='dostawca_id',
             right_on='dost_id',
             how='left'
         )
     
-    # Uzupełnij "Brak dostawcy" tam gdzie pusto (dla starych rekordów)
+    # Uzupełnij "Brak dostawcy" tam gdzie pusto
     if 'dostawca_nazwa' in df_magazyn.columns:
         df_magazyn['dostawca_nazwa'] = df_magazyn['dostawca_nazwa'].fillna('Brak danych')
 
@@ -81,7 +92,6 @@ def get_inventory_merged():
 
 def add_or_update_item(nazwa, ilosc, cena, kategoria_id, kategoria_nazwa, dostawca_id, dostawca_nazwa):
     # Sprawdzamy czy towar o tej nazwie OD TEGO SAMEGO DOSTAWCY istnieje
-    # (Bo możemy mieć jabłka od Janusza i jabłka od Apple - to inne partie)
     existing = supabase.table('magazyn').select("*").eq('nazwa', nazwa).eq('dostawca_id', dostawca_id).execute()
     
     if existing.data:
@@ -133,7 +143,7 @@ if choice == "Stan Magazynowy":
     
     if not df.empty and 'ilosc' in df.columns:
         
-        # Kolumny do grupowania (Nazwa, Kategoria, Dostawca)
+        # Kolumny do grupowania
         group_cols = ['nazwa']
         if 'kategoria_nazwa' in df.columns: group_cols.append('kategoria_nazwa')
         if 'dostawca_nazwa' in df.columns: group_cols.append('dostawca_nazwa')
@@ -166,7 +176,6 @@ if choice == "Stan Magazynowy":
 
             # TABELA
             cols_to_show = ['nazwa', 'Kategoria', 'Dostawca', 'ilosc', 'cena', 'Wartość']
-            # Zabezpieczenie gdyby jakiejś kolumny nie było (np. brak dostawców w bazie)
             final_cols = [c for c in cols_to_show if c in df_view.columns]
             
             st.dataframe(
@@ -228,15 +237,12 @@ elif choice == "Wydanie/Edycja":
     df = get_inventory_merged()
     
     if not df.empty and 'nazwa' in df.columns:
-        # Tworzymy unikalną etykietę dla listy rozwijanej (Nazwa + Dostawca)
-        # bo możemy mieć ten sam towar od dwóch dostawców
+        # Tworzymy unikalną etykietę dla listy rozwijanej
         df['label'] = df['nazwa'] + " (Dost: " + df['dostawca_nazwa'].fillna('?') + ")"
         
-        # Sortujemy
         sorted_labels = sorted(df['label'].unique())
         sel_label = st.selectbox("Wybierz produkt", sorted_labels)
         
-        # Znajdujemy wiersz
         row = df[df['label'] == sel_label].iloc[0]
         
         curr_id = int(row['id'])
@@ -281,7 +287,6 @@ elif choice == "Remanent (Raport)":
     if not df.empty:
         df['Wartosc'] = df['ilosc'] * df['cena']
         
-        # Ładne nazwy
         cols = ['nazwa', 'ilosc', 'cena', 'Wartosc']
         if 'kategoria_nazwa' in df.columns: 
             df = df.rename(columns={'kategoria_nazwa': 'Kategoria'})
@@ -290,7 +295,9 @@ elif choice == "Remanent (Raport)":
             df = df.rename(columns={'dostawca_nazwa': 'Dostawca'})
             cols.insert(2, 'Dostawca')
             
-        export_df = df[cols]
+        # Zabezpieczenie kolumn
+        final_cols = [c for c in cols if c in df.columns]
+        export_df = df[final_cols]
         export_df['Data'] = datetime.datetime.now().strftime("%Y-%m-%d")
         
         st.dataframe(export_df, use_container_width=True)
